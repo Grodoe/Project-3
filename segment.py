@@ -322,7 +322,20 @@ class RdtBuffer:
         Follow putNext: take the Condition, wait_for the state you need, change
         it, notify_all, release.
         """
-        raise NotImplementedError
+        with self.cv:
+            has_segment = self.cv.wait_for(
+                lambda: self.base < self.next or self.closed, timeout)
+            if not has_segment or self.closed:
+                return None
+            # if we get here, we have a segment to return
+            seg = self.slots[self.base % self.size]
+            # remove the segment from the slot and advance base
+            self.slots[self.base % self.size] = None
+            # advance base to the next logical index
+            self.base += 1
+            # notify all waiting threads that the buffer state has changed
+            self.cv.notify_all()
+            return seg
 
     def putSeqNum(self, seg, index):
         """Place a segment at a logical index that may be ahead of `base`.
