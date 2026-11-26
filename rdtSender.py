@@ -28,6 +28,7 @@ class Sender:
     protects which variable and write it down here -- you will be asked.
     """
 
+
     def __init__(self, sock, channelAddr, protocol):
         """Set up the window and the timers.
 
@@ -62,7 +63,80 @@ class Sender:
         Cancelling a timer is then an assignment. The value is config.RTO_INIT
         and it does not change; measuring the path is the bonus.
         """
-        raise NotImplementedError
+
+        self.socket = sock
+        self.channelAddr = channelAddr
+        self.protocol = protocol
+        self.buf = RdtBuffer(config.WINDOW)
+        self.buf_lock = threading.Lock()
+
+    # def read_data(self, num_bytes):
+    #     chunks = []
+    #     bytes_received = 0
+    #     while bytes_received < num_bytes:
+    #         chunk = self.socket.recv(num_bytes - bytes_received)
+    #         if not chunk:
+    #             raise ConnectionError("Socket closed before receiving all bytes")
+    #         chunks.append(chunk)
+    #         bytes_received += len(chunk)
+    #     return chunks
+
+    def retransmit(self):
+        # self.buf.cv.acquire()
+        for i in range(self.buf.base, self.buf.next):
+            # Implement once i see the sending code
+                # Needs to send packed base to next-1 and update thier deadlines
+            # Temporary untill I see how the sending function handled this
+            segment = self.buf.get(i)
+            packed_datagram = segment.pack()
+            self.socket.sendto(packed_datagram, self.channelAddr)
+            segment.deadline = time.monotonic()+config.RTO_INIT
+        # self.buf.cv.release()
+    
+    def worker(self):
+
+        while(True):
+            try:
+                # Extracting the data from the socket
+                datagram = self.socket.recv(65535)
+
+                header = datagram[0:segment.HEADER_LEN]            
+                if(len(header) != segment.HEADER_LEN):
+                    continue
+                
+                seq_num, ack_num, flags,checksum, rcv_win, length = segment.struct.unpack(segment.HEADER,header)
+                data = datagram[segment.HEADER_LEN:]
+
+                if(len(datagram) != length+segment.HEADER_LEN):
+                    continue
+
+                if(segment.validate(header+data) != None):
+                    # Failed validation Discarding the data and moving onto the next message
+                    continue
+
+                if(flags & 0x01):
+                    # Handle ack
+                    # The instructions say this should be included in the loop but the implementation of markAcked comes in a later task
+                    # self.buf_lock.acquire()
+                    if(ack_num == segment.mask(self.buf.base)):
+                        self.buf.markAcked(self.buf.base)
+                    # self.buf_lock.release()
+            except socket.timeout:
+                # I dont want to do anything special currently if there is a timeout 
+                # just check that all of the previous segnments to see if they need to 
+                # be resent and then move on
+                print("", end="")
+            finally:
+                base_segment = self.buf.get(self.buf.base)
+                if(base_segment != None and base_segment.deadline < time.monotonic()):
+                    # Deadline has passed for the oldest segment. Retransmiting
+                    self.retransmit()
+
+
+
+
+
+
 
     def start(self):
         """Start the network thread.
@@ -79,7 +153,11 @@ class Sender:
 
         Do the socket call outside the buffer's Condition, never inside it.
         """
-        raise NotImplementedError
+
+        #Setting a timeout of 50 ms
+        self.socket.settimeout(50/1000)
+        network_thread = threading.Thread(target=self.worker)
+        network_thread.start()
 
     def send(self, payload):
         """Hand one segment's worth of data to the protocol.

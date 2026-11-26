@@ -377,8 +377,17 @@ class RdtBuffer:
         which is why one call can free several slots and wake an application
         thread that has been blocked in putNext.
         """
-        raise NotImplementedError
+        with self.cv:
+            while(self.base <= index):
+                segment = self.get(self.base)
+                if(segment == None):
+                    break
 
+                segment.acked = True
+                segment.deadline = None
+                self.base+=1
+                self.cv.notify_all()
+        
 
 # ============================================================================
 # GIVEN - do not modify anything below this line.
