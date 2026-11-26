@@ -50,8 +50,12 @@ class Receiver:
         config.WINDOW until task 5 and segment.checkWindow(protocol) afterward.
         Go-Back-N never needs it: its receive window is one segment.
         """
-        raise NotImplementedError
-
+        self.sock=sock
+        self.channelAddr=channelAddr
+        self.protocol=protocol
+        self.buf = RdtBuffer(config.RCV_BUF)
+        self.win = config.WINDOW
+        self.thread = None
     def start(self):
         """Start the network thread.
 
@@ -68,7 +72,9 @@ class Receiver:
         flow control in task 3 exists to prevent. Keep the socket call and the
         delivery outside the buffer's Condition and it stays survivable.
         """
-        raise NotImplementedError
+        self.thread = threading.Thread(target=self._networkThread, daemon=True)
+        self.thread.start()
+
 
     def receive(self):
         """Return one segment's payload, in order, blocking until there is one.
@@ -77,7 +83,57 @@ class Receiver:
         has been handed over. Each segment must be returned exactly once, ever,
         however many times it arrives.
         """
-        raise NotImplementedError
+        seg = self.buf.getNext()
+        if seg is None:
+            return None
+        return seg.payload
+
+    def sendAck(self, index):
+        with self.buf.cv:
+            r_base = self.buf.base
+            r_next = self.buf.firstEmpty()
+            r_win = self.buf.freeSlots()
+
+        ack = RDTSegment(
+            seqNum=0,
+            ackNum=segment.mask(index),
+            flags = segment.FLAG_ACK,
+            rcvWin = r_win,
+            payload=b""
+        )
+        self.sock.sendto(ack.pack(), self.channelAddr)
+        segment.traceSend(ack, r_base, r_next, r_win)
+
+    def _networkThread(self):
+        while True:
+            try:
+                datagram, addr = self.sock.recvfrom(4096)
+            except OSError:
+                break
+
+            if RDTSegment.validate(datagram) is not None:
+                continue
+
+            seg = RDTSegment.unpack(datagram)
+            with self.buf.cv:
+                r_base = self.buf.base
+                r_next = self.buf.firstEmpty()
+                r_win = self.buf.freeSlots()
+            segment.traceRecv(seg, r_base, r_next, r_win)
+
+            if seg.isAck:
+                continue
+
+            expected =  self.buf.firstEmpty()
+            if seg.seqNum == segment.mask(expected):
+                self.buf.putSeqNum(seg,expected)
+                self.sendAck(expected)
+            elif expected > 0:
+                self.sendAck(expected - 1)
+
+    
+
+
 
     def waitClosed(self):
         """Block until the connection has been taken down, and report whether

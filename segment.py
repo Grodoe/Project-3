@@ -356,6 +356,26 @@ class RdtBuffer:
         rdtReceiver.py. Placing a segment at the wrong index is therefore not a
         local mistake: it delivers the file in the wrong order.
         """
+        with self.cv:
+            if self.closed:
+                return False
+            max_index = self.base + self.size
+            if not (self.base <= index < max_index):
+                return False
+
+            slot_index = index % self.size
+            if self.slots[slot_index] is not None:
+                return False
+
+            self.slots[slot_index] = seg
+            if index >= self.next:
+                self.next = index + 1
+            self.cv.notify_all()
+            return True
+        
+            
+
+
         raise NotImplementedError
 
     def markAcked(self, index):
