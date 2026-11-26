@@ -104,7 +104,7 @@ class Receiver:
         self.sock.sendto(ack.pack(), self.channelAddr)
         segment.traceSend(ack, r_base, r_next, r_win)
 
-    def networkLoop(self):
+    def _networkThread(self):
         while True:
             try:
                 datagram, addr = self.sock.recvfrom(4096)
