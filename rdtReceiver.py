@@ -77,6 +77,9 @@ class Receiver:
         has been handed over. Each segment must be returned exactly once, ever,
         however many times it arrives.
         """
+        return getNext()
+
+
         raise NotImplementedError
 
     def waitClosed(self):

@@ -322,6 +322,8 @@ class RdtBuffer:
         Follow putNext: take the Condition, wait_for the state you need, change
         it, notify_all, release.
         """
+
+
         raise NotImplementedError
 
     def putSeqNum(self, seg, index):
