@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/Users/vincentsuen/Project-3/channel.py", line 291, in <module>
+    main()
+  File "/Users/vincentsuen/Project-3/channel.py", line 205, in main
+    for key, _mask in sel.select(timeout=timeout):
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/selectors.py", line 561, in select
+    kev_list = self._selector.control(None, max_ev, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

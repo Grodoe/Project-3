@@ -92,8 +92,51 @@ class Sender:
         reopen it, because there is nothing left to acknowledge. After
         config.PERSIST seconds, transmit anyway.
         """
-        raise NotImplementedError
+        # If the network thread already gave up (receiver unreachable, FIN
+        # never acknowledged, ...), refuse new data so main() stops sending.
+        if self.failed:
+            return False
 
+        # nextIdx is the logical index of this segment. It counts up forever
+        # and never wraps. mask() reduces it into the sequence-number space
+        idx = self.nextIdx
+        seg = RDTSegment(seqNum=segment.mask(idx), flags=0, payload=payload)
+
+        # ---- 1. Wait for room in the window ---------------------------------
+        while True:
+            # putNext blocks inside the buffer's Condition variable (buf.cv)
+            # while next - base >= the window.
+            if self.buf.putNext(seg, timeout=config.PERSIST):
+                break                               # placed in the window
+            if self.failed or self.buf.closed:
+                return False
+            # Read the effective window under self.lock, since rightEdge is
+            with self.lock:
+                zeroWindow = self._win() == 0
+            # Zero-window deadlock
+            if zeroWindow and self.buf.outstanding() == 0:
+                self.buf.putNext(seg, force=True) 
+                break
+            # Otherwise the window is full of segments still in flight. Their
+            # ACKs (or retransmissions) will open it, so go back and wait again.
+        self.nextIdx += 1
+        with self.lock:
+            now = time.monotonic()
+            # sentUpTo = one past the highest index transmitted.
+            self.sentUpTo = idx + 1
+            if self.buf.outstanding() == 1:
+                self.lastHeard = now
+
+            self._transmit(seg)
+            if self.protocol == "gbn":
+                # Go-Back-N keeps ONE timer, for the oldest unacknowledged segment.
+                if self.gbnDeadline is None:
+                    self.gbnDeadline = now + config.RTO_INIT
+            else:
+                # Selective Repeat gives every segment its own timer.
+                seg.deadline = now + config.RTO_INIT
+        return True
+    
     def close(self):
         """Wait for every segment to be acknowledged, then take the connection
         down: send a FIN, retransmit it if it is lost, and return True once it
