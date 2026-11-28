@@ -67,76 +67,106 @@ class Sender:
         self.socket = sock
         self.channelAddr = channelAddr
         self.protocol = protocol
+        # The buffer guards slots/base/next with its own Condition (buf.cv).
         self.buf = RdtBuffer(config.WINDOW)
-        self.buf_lock = threading.Lock()
 
-    # def read_data(self, num_bytes):
-    #     chunks = []
-    #     bytes_received = 0
-    #     while bytes_received < num_bytes:
-    #         chunk = self.socket.recv(num_bytes - bytes_received)
-    #         if not chunk:
-    #             raise ConnectionError("Socket closed before receiving all bytes")
-    #         chunks.append(chunk)
-    #         bytes_received += len(chunk)
-    #     return chunks
+        # self.lock guards everything below, which both threads touch:
+        # rcvWin, gbnDeadline, sentUpTo, lastHeard, failed.
+        self.lock = threading.Lock()
+        self.rcvWin = config.WINDOW   # last window the receiver advertised
+        self.gbnDeadline = None       # GBN's single timer (oldest unacked)
+        self.sentUpTo = 0             # one past the highest index transmitted
+        self.lastHeard = time.monotonic()
+        self.failed = None            # reason string once the transfer fails
 
-    def retransmit(self):
-        # self.buf.cv.acquire()
-        for i in range(self.buf.base, self.buf.next):
-            # Implement once i see the sending code
-                # Needs to send packed base to next-1 and update thier deadlines
-            # Temporary untill I see how the sending function handled this
-            segment = self.buf.get(i)
-            packed_datagram = segment.pack()
-            self.socket.sendto(packed_datagram, self.channelAddr)
-            segment.deadline = time.monotonic()+config.RTO_INIT
-        # self.buf.cv.release()
-    
+        # Only the application thread touches nextIdx, so it needs no lock.
+        self.nextIdx = 0
+        self.thread = None
+
+    # ------------------------------------------------------------- helpers
+
+    def _win(self):
+        """The window usable right now: WINDOW capped by the receiver's rcvWin.
+        Caller holds self.lock."""
+        return min(config.WINDOW, self.rcvWin)
+
+    def _transmit(self, seg):
+        """Put one segment on the wire and trace it. No buffer lock is held."""
+        try:
+            self.socket.sendto(seg.pack(), self.channelAddr)
+        except OSError:
+            return
+        segment.traceSend(seg, self.buf.base, self.buf.next, self._win())
+
+    def _ackIndex(self, ackNum):
+        """Turn a wire ackNum back into a logical index near base."""
+        base = self.buf.base
+        return base + ((ackNum - segment.mask(base)) % segment.space())
+
+    def _onAck(self, seg):
+        idx = self._ackIndex(seg.ackNum)
+        with self.lock:
+            self.lastHeard = time.monotonic()
+            self.rcvWin = seg.rcvWin
+            win = self._win()
+        self.buf.setLimit(win)
+        segment.traceRecv(seg, self.buf.base, self.buf.next, win)
+
+        if not (self.buf.base <= idx < self.buf.next):
+            return                          # duplicate or stale ACK
+        if self.protocol == "gbn":
+            self.buf.markAcked(idx)         # cumulative: base slides past idx
+            with self.lock:
+                # Restart the single timer for whatever is still outstanding.
+                if self.buf.outstanding() == 0:
+                    self.gbnDeadline = None
+                else:
+                    self.gbnDeadline = time.monotonic() + config.RTO_INIT
+        else:
+            self.buf.markAcked(idx)
+
+    def _checkTimers(self):
+        now = time.monotonic()
+        if self.protocol == "gbn":
+            with self.lock:
+                expired = self.gbnDeadline is not None and now >= self.gbnDeadline
+                if expired:
+                    self.gbnDeadline = now + config.RTO_INIT
+            if not expired:
+                return
+            base, nxt = self.buf.base, self.buf.next
+            segment.traceTimeout(segment.mask(base), base, nxt)
+            for i in range(base, nxt):      # Go-Back-N: resend the whole window
+                seg = self.buf.get(i)
+                if seg is not None:
+                    with self.lock:
+                        self._transmit(seg)
+        else:
+            for i in range(self.buf.base, self.buf.next):
+                seg = self.buf.get(i)
+                if seg is None or seg.acked or seg.deadline is None:
+                    continue
+                if now >= seg.deadline:
+                    segment.traceTimeout(seg.seqNum, self.buf.base, self.buf.next)
+                    seg.deadline = now + config.RTO_INIT
+                    with self.lock:
+                        self._transmit(seg)
+
     def worker(self):
-
-        while(True):
+        while True:
             try:
-                # Extracting the data from the socket
                 datagram = self.socket.recv(65535)
-
-                header = datagram[0:segment.HEADER_LEN]            
-                if(len(header) != segment.HEADER_LEN):
-                    continue
-                
-                seq_num, ack_num, flags,checksum, rcv_win, length = segment.struct.unpack(segment.HEADER,header)
-                data = datagram[segment.HEADER_LEN:]
-
-                if(len(datagram) != length+segment.HEADER_LEN):
-                    continue
-
-                if(segment.validate(header+data) != None):
-                    # Failed validation Discarding the data and moving onto the next message
-                    continue
-
-                if(flags & 0x01):
-                    # Handle ack
-                    # The instructions say this should be included in the loop but the implementation of markAcked comes in a later task
-                    # self.buf_lock.acquire()
-                    if(ack_num == segment.mask(self.buf.base)):
-                        self.buf.markAcked(self.buf.base)
-                    # self.buf_lock.release()
             except socket.timeout:
-                # I dont want to do anything special currently if there is a timeout 
-                # just check that all of the previous segnments to see if they need to 
-                # be resent and then move on
-                print("", end="")
-            finally:
-                base_segment = self.buf.get(self.buf.base)
-                if(base_segment != None and base_segment.deadline < time.monotonic()):
-                    # Deadline has passed for the oldest segment. Retransmiting
-                    self.retransmit()
+                datagram = None
+            except OSError:
+                return                      # socket closed by main()
 
+            if datagram is not None and RDTSegment.validate(datagram) is None:
+                seg = RDTSegment.unpack(datagram)
+                if seg.isAck and not seg.isFin:
+                    self._onAck(seg)
 
-
-
-
-
+            self._checkTimers()
 
     def start(self):
         """Start the network thread.
@@ -153,11 +183,9 @@ class Sender:
 
         Do the socket call outside the buffer's Condition, never inside it.
         """
-
-        #Setting a timeout of 50 ms
-        self.socket.settimeout(50/1000)
-        network_thread = threading.Thread(target=self.worker)
-        network_thread.start()
+        self.socket.settimeout(0.005)
+        self.thread = threading.Thread(target=self.worker, daemon=True)
+        self.thread.start()
 
     def send(self, payload):
         """Hand one segment's worth of data to the protocol.
@@ -170,8 +198,7 @@ class Sender:
         reopen it, because there is nothing left to acknowledge. After
         config.PERSIST seconds, transmit anyway.
         """
-        # If the network thread already gave up (receiver unreachable, FIN
-        # never acknowledged, ...), refuse new data so main() stops sending.
+        # If the network thread already gave up -> refuse new data so main() stops sending.
         if self.failed:
             return False
 
@@ -180,12 +207,10 @@ class Sender:
         idx = self.nextIdx
         seg = RDTSegment(seqNum=segment.mask(idx), flags=0, payload=payload)
 
-        # ---- 1. Wait for room in the window ---------------------------------
         while True:
-            # putNext blocks inside the buffer's Condition variable (buf.cv)
-            # while next - base >= the window.
+            # putNext blocks inside the buffer's Condition variable 
             if self.buf.putNext(seg, timeout=config.PERSIST):
-                break                               # placed in the window
+                break                               
             if self.failed or self.buf.closed:
                 return False
             # Read the effective window under self.lock, since rightEdge is
@@ -195,8 +220,6 @@ class Sender:
             if zeroWindow and self.buf.outstanding() == 0:
                 self.buf.putNext(seg, force=True) 
                 break
-            # Otherwise the window is full of segments still in flight. Their
-            # ACKs (or retransmissions) will open it, so go back and wait again.
         self.nextIdx += 1
         with self.lock:
             now = time.monotonic()
